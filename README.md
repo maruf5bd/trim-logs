@@ -63,7 +63,7 @@ A file is processed if **any** of these match:
 
 ```bash
 # Download
-wget https://raw.githubusercontent.com/YOUR_USERNAME/trim-logs/main/trim_logs.sh
+wget https://raw.githubusercontent.com/maruf5bd/trim-logs/main/trim_logs.sh
 
 # Make executable
 chmod +x trim_logs.sh
