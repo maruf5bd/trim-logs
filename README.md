@@ -67,6 +67,8 @@ wget https://raw.githubusercontent.com/maruf5bd/trim-logs/main/trim_logs.sh
 
 # Make executable
 chmod +x trim_logs.sh
+bash trim_logs.sh
+sudo bash trim_logs.sh
 ```
 
 ---
