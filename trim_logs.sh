@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
-# trim_logs.sh — Deep system-wide log trimmer
-# Scans everywhere including /var/www and /home.
-# A file is processed if:
-#   - Its extension is a known log extension (.log, .err, .out, etc.)  OR
-#   - Its filename (stem) is a known log name (error_log, access_log, etc.)
-# Source code files (.php, .scss, .js, .po, etc.) are always skipped.
+# trim_logs.sh — Deep system-wide log trimmer (cron-optimised)
 #
-# Pipeline per matched file:
+# On first run: processes every log file found.
+# On subsequent runs: skips any file whose mtime+size hasn't changed since
+#   it was last processed — making cron re-runs very fast.
+#
+# Pipeline per changed file:
 #   1. Remove ALL duplicate lines (first occurrence kept, order preserved)
 #   2. Collapse consecutive repeated lines (uniq)
 #   3. Keep only the last 1 MB
+#
+# Cache stored in: /var/cache/trim_logs/state.db  (tab-separated)
+# Format:  <mtime>TAB<size>TAB<filepath>
 # =============================================================================
 
-MAX_BYTES=$((1 * 1024 * 1024))   # 1 MB
+MAX_BYTES=$((1 * 1024 * 1024))          # 1 MB
+STATE_DIR="/var/cache/trim_logs"
+STATE_FILE="${STATE_DIR}/state.db"
+STATE_TMP="${STATE_DIR}/state.tmp.$$"   # atomic write target
 
 # ---------- extensions that ARE log files ------------------------------------
 LOG_EXTENSIONS=(
@@ -30,44 +35,30 @@ LOG_EXTENSIONS=(
 LOG_FILENAMES=(
     error_log access_log debug_log warn_log trace_log
     syslog messages auth daemon kern mail cron dmesg
-    letsencrypt lastlog faillog wtwtmp btmp
+    letsencrypt lastlog faillog btmp
     php_error php_errors
     stdout stderr output combined
 )
 
-# ---------- filename must contain one of these words (case-insensitive) ------
-# Only used when the file has NO extension (bare filename check)
-LOG_KEYWORDS=(
-    error_log access_log debug_log
-)
-
-# ---------- extensions that are NEVER log files (source / data / media) ------
+# ---------- extensions that are NEVER log files ------------------------------
 SKIP_EXTENSIONS=(
-    # web source
     php php5 php7 php8 phtml
     js jsx ts tsx mjs cjs
     css scss sass less styl
     html htm xhtml
     twig blade smarty
-    # data & config
     xml json yaml yml toml ini cfg conf env
     sql db sqlite sqlite3
-    # translation / docs
     po pot mo
     txt md rst tex
-    # archives
     gz bz2 xz zip zst 7z tar rar
-    # binary / compiled
     bin so a o ko exe rpm deb
-    # media
     jpg jpeg png gif ico svg webp mp3 mp4 avi mkv
-    # misc
     pid sock lock bak bk swp tmp
-    # WordPress/PHP specific
     neon phar map min
 )
 
-# ---------- dirs to skip entirely (databases, pseudo-fs, virtfs) -------------
+# ---------- dirs to skip entirely --------------------------------------------
 SKIP_DIRS=(
     /var/lib/mysql
     /var/lib/mariadb
@@ -75,48 +66,43 @@ SKIP_DIRS=(
     /var/lib/mongodb
     /var/lib/redis
     /var/lib/docker
-    /proc
-    /sys
-    /dev
-    /run
-    /snap
-    /boot
-    /lost+found
-    /media
-    /cdrom
-    /usr
-    /etc
-    /home/virtfs        # cPanel virtual filesystem — contains OS/Python source mounts
+    /proc /sys /dev /run
+    /snap /boot /lost+found /media /cdrom
+    /usr /etc
+    /home/virtfs
+    "${STATE_DIR}"          # never process our own cache
 )
 
 # ---------- counters & flags -------------------------------------------------
 TRIMMED=0
 DEDUPED=0
 SKIPPED=0
+UNCHANGED=0
 ERRORS=0
 DRY_RUN=false
 VERBOSE=false
 DEBUG=false
+RESET_CACHE=false
 
 # ---------- helpers ----------------------------------------------------------
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Scans the entire system (including /var/www and /home) for log files.
-A file qualifies if its extension is a known log extension, or its
-filename matches a known log name. Source code files are always skipped.
-
-Pipeline:
-  1. Remove all duplicate lines (first occurrence wins)
+Scans the entire system for log files and trims each one:
+  1. Remove all duplicate lines
   2. Collapse consecutive repeated lines
   3. Trim to last 1 MB
 
+Cron-optimised: files unchanged since last run are skipped instantly
+using a mtime+size cache stored at: ${STATE_FILE}
+
 Options:
-  -d, --dry-run   Preview without modifying any files
-  -v, --verbose   Show every file checked including skips
-      --debug     Print first 30 files find sees, then exit
-  -h, --help      Show this help
+  -d, --dry-run      Preview without modifying any files
+  -v, --verbose      Show every file checked including skips/unchanged
+      --reset-cache  Force reprocess all files (ignore cache)
+      --debug        Print first 30 files find sees, then exit
+  -h, --help         Show this help
 EOF
     exit 0
 }
@@ -134,7 +120,6 @@ human_size() {
     fi
 }
 
-# True if $1 is in the remaining args
 in_array() {
     local needle="$1"; shift
     local item
@@ -150,18 +135,16 @@ in_skip_dir() {
     return 1
 }
 
-# Get lowercase extension of a filename (empty string if none)
 get_ext() {
-    local base="$1"
-    local ext="${base##*.}"
-    [[ "$base" == "$ext" ]] && { echo ""; return; }   # no dot → no extension
+    local base="$1" ext
+    ext="${base##*.}"
+    [[ "$base" == "$ext" ]] && { echo ""; return; }
     echo "${ext,,}"
 }
 
-# Get the stem (filename without final extension), lowercased
 get_stem() {
-    local base="$1"
-    local ext="${base##*.}"
+    local base="$1" ext
+    ext="${base##*.}"
     [[ "$base" == "$ext" ]] && { echo "${base,,}"; return; }
     echo "${base%.*}" | tr '[:upper:]' '[:lower:]'
 }
@@ -171,18 +154,72 @@ is_text_file() {
         file -b --mime-type "$1" 2>/dev/null | grep -q '^text/' && return 0
         return 1
     else
-        # fallback: null bytes = binary
         grep -qP '\x00' "$1" 2>/dev/null && return 1
         return 0
     fi
 }
 
+# ── Cache helpers ─────────────────────────────────────────────────────────────
+# Returns "<mtime> <size>" for a file
+file_signature() {
+    stat -c '%Y %s' "$1" 2>/dev/null || echo "0 0"
+}
+
+# Load state.db into associative array  cache[filepath]="mtime size"
+declare -A CACHE
+
+load_cache() {
+    [[ -f "$STATE_FILE" ]] || return
+    while IFS=$'\t' read -r mtime size fp; do
+        [[ -n "$fp" ]] && CACHE["$fp"]="${mtime} ${size}"
+    done < "$STATE_FILE"
+    log_info "Cache loaded: ${#CACHE[@]} entries from ${STATE_FILE}"
+}
+
+# Write updated cache atomically
+save_cache() {
+    $DRY_RUN && return   # never mutate cache in dry-run
+    mkdir -p "$STATE_DIR"
+    # Merge: start from old cache, overlay new entries written during this run
+    # NEW_CACHE associative array was populated during processing
+    {
+        # Keep old entries for files we didn't touch this run
+        for fp in "${!CACHE[@]}"; do
+            [[ -z "${NEW_CACHE[$fp]+x}" ]] && {
+                local old="${CACHE[$fp]}"
+                printf '%s\t%s\t%s\n' "${old% *}" "${old#* }" "$fp"
+            }
+        done
+        # Write new/updated entries
+        for fp in "${!NEW_CACHE[@]}"; do
+            local sig="${NEW_CACHE[$fp]}"
+            printf '%s\t%s\t%s\n' "${sig% *}" "${sig#* }" "$fp"
+        done
+    } | sort -t$'\t' -k3 > "$STATE_TMP" && mv "$STATE_TMP" "$STATE_FILE"
+}
+
+declare -A NEW_CACHE
+
+# Record the post-process signature of a file into NEW_CACHE
+record_signature() {
+    local fp="$1"
+    local sig
+    sig=$(file_signature "$fp")
+    NEW_CACHE["$fp"]="$sig"
+}
+
+# True if the file is unchanged since last run
+is_unchanged() {
+    local fp="$1"
+    local cached="${CACHE[$fp]:-}"
+    [[ -z "$cached" ]] && return 1           # not in cache → must process
+    local current
+    current=$(file_signature "$fp")
+    [[ "$cached" == "$current" ]] && return 0   # same mtime+size → skip
+    return 1
+}
+
 # ── Master gate ───────────────────────────────────────────────────────────────
-# A file passes if:
-#   1. Not in a skip dir
-#   2. Not a skip extension
-#   3. Is plain text
-#   4. Has a log extension  OR  has a log filename/stem
 should_process() {
     local fp="$1"
     local base ext stem
@@ -190,41 +227,32 @@ should_process() {
     ext=$(get_ext "$base")
     stem=$(get_stem "$base")
 
-    # Rule 1: skip protected dirs
-    if in_skip_dir "$fp"; then
-        $VERBOSE && log_info "SKIP [protected dir]   $fp"
+    in_skip_dir "$fp" && {
+        $VERBOSE && log_info "SKIP [protected dir]      $fp"
         (( SKIPPED++ )); return 1
-    fi
+    }
 
-    # Rule 2: skip source-code / data extensions immediately
     if [[ -n "$ext" ]] && in_array "$ext" "${SKIP_EXTENSIONS[@]}"; then
-        $VERBOSE && log_info "SKIP [source ext .$ext]  $fp"
+        $VERBOSE && log_info "SKIP [source ext .$ext]   $fp"
         (( SKIPPED++ )); return 1
     fi
 
-    # Rule 3: must be plain text (skip compiled/binary files with no extension)
-    if ! is_text_file "$fp"; then
-        $VERBOSE && log_info "SKIP [binary]          $fp"
+    is_text_file "$fp" || {
+        $VERBOSE && log_info "SKIP [binary]             $fp"
         (( SKIPPED++ )); return 1
+    }
+
+    # Check cache BEFORE the expensive is_text_file already passed — fast path
+    if ! $RESET_CACHE && is_unchanged "$fp"; then
+        $VERBOSE && log_info "SKIP [unchanged]          $fp"
+        (( UNCHANGED++ )); return 1
     fi
 
-    # Rule 4a: known log extension
-    if [[ -n "$ext" ]] && in_array "$ext" "${LOG_EXTENSIONS[@]}"; then
-        return 0
-    fi
+    [[ -n "$ext" ]] && in_array "$ext" "${LOG_EXTENSIONS[@]}" && return 0
+    [[ -z "$ext" ]] && in_array "$stem" "${LOG_FILENAMES[@]}" && return 0
+    [[ -z "$ext" ]] && echo "$stem" | grep -qiE '^(.*_log|log_.*)$' && return 0
 
-    # Rule 4b: exact log filename (no extension, e.g. "error_log", "syslog")
-    if [[ -z "$ext" ]] && in_array "$stem" "${LOG_FILENAMES[@]}"; then
-        return 0
-    fi
-
-    # Rule 4c: bare filename contains _log suffix/prefix AND has no extension
-    # e.g. "error_log", "php_error_log" — but NOT "_log.py", "web_log.py" etc.
-    if [[ -z "$ext" ]] && echo "$stem" | grep -qiE '^(.*_log|log_.*)$'; then
-        return 0
-    fi
-
-    $VERBOSE && log_info "SKIP [not a log]       $fp"
+    $VERBOSE && log_info "SKIP [not a log]          $fp"
     (( SKIPPED++ )); return 1
 }
 
@@ -235,8 +263,10 @@ process_file() {
     orig_size=$(stat -c%s "$fp" 2>/dev/null || echo 0)
 
     if (( orig_size == 0 )); then
-        $VERBOSE && log_info "SKIP [empty]           $fp"
-        (( SKIPPED++ )); return
+        $VERBOSE && log_info "SKIP [empty]              $fp"
+        (( SKIPPED++ ))
+        record_signature "$fp"
+        return
     fi
 
     if $DRY_RUN; then
@@ -278,6 +308,9 @@ process_file() {
     fi
     rm -f "$tmp_a"
 
+    # Record new signature AFTER writing (so next run sees the trimmed state)
+    record_signature "$fp"
+
     local changed=false actions=()
     (( orig_size != dedup_size )) && { actions+=("deduped $(human_size "$orig_size")→$(human_size "$dedup_size")"); changed=true; (( DEDUPED++ )); }
     (( dedup_size > MAX_BYTES  )) && { actions+=("trimmed→$(human_size "$final_size")"); changed=true; }
@@ -286,17 +319,19 @@ process_file() {
         log_info "$(printf '%-65s' "$fp")  [$(IFS=', '; echo "${actions[*]}")]"
         (( TRIMMED++ ))
     else
-        $VERBOSE && log_info "OK  $fp  ($(human_size "$orig_size"))"
+        # File was in scope (new to cache) but already clean
+        $VERBOSE && log_info "OK (clean)                $fp  ($(human_size "$orig_size"))"
     fi
 }
 
 # ---------- arg parsing ------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -d|--dry-run) DRY_RUN=true  ;;
-        -v|--verbose) VERBOSE=true  ;;
-        --debug)      DEBUG=true    ;;
-        -h|--help)    usage          ;;
+        -d|--dry-run)    DRY_RUN=true     ;;
+        -v|--verbose)    VERBOSE=true     ;;
+        --reset-cache)   RESET_CACHE=true ;;
+        --debug)         DEBUG=true       ;;
+        -h|--help)       usage             ;;
         *) log_err "Unknown option: $1"; usage ;;
     esac
     shift
@@ -326,10 +361,14 @@ if $DEBUG; then
     exit 0
 fi
 
+# ---------- init cache -------------------------------------------------------
+mkdir -p "$STATE_DIR"
+$RESET_CACHE && { log_info "--reset-cache: ignoring existing cache, all files will be reprocessed."; rm -f "$STATE_FILE"; }
+load_cache
+
 # ---------- main scan --------------------------------------------------------
 log_info "Starting deep system-wide log scan (includes /var/www and /home)..."
-log_info "Matches: known log extensions (.log, .err, .out ...) + known log filenames (error_log, syslog ...)"
-log_info "Pipeline: dedup all lines  ->  collapse consecutive  ->  trim to 1MB"
+log_info "Cache: ${STATE_FILE}"
 $DRY_RUN && log_info "DRY-RUN — no files will be modified."
 echo ""
 
@@ -349,12 +388,15 @@ done < <(
         -o -type f -print0 2>/dev/null
 )
 
-# ---------- summary ----------------------------------------------------------
+# ---------- save cache & summary ---------------------------------------------
+save_cache
+
 echo ""
 echo "======================================================"
 echo "  Scan complete"
 echo "  Files modified      : $TRIMMED"
 echo "  Files deduplicated  : $DEDUPED"
+echo "  Files unchanged     : $UNCHANGED  (skipped via cache)"
 echo "  Files skipped       : $SKIPPED"
 echo "  Errors              : $ERRORS"
 $DRY_RUN && echo "  (DRY-RUN — nothing was written)"
